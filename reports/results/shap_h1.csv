@@ -1,0 +1,16 @@
+feature,mean_abs_shap
+target_month,0.05615
+seas_prior,0.02080
+nat_seas_prior,0.01790
+cat,0.01275
+r6,0.01006
+r1,0.00690
+nat_r1,0.00666
+yoy,0.00554
+r3,0.00549
+log_level,0.00455
+region,0.00422
+dev_roll3,0.00335
+r2,0.00189
+market_access,0.00047
+h,0.00000
