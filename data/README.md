@@ -1,26 +1,23 @@
 # Данные
 
-Сырые файлы в репозиторий не коммитятся (см. `.gitignore`): их нужно скачать
-вручную с сайта СберИндекса и положить в `data/raw/`.
+Сырые файлы в репозиторий не коммитятся (`.gitignore`). Скачать: `bash scripts/get_data.sh`.
 
-| Набор данных | Где взять | Куда положить |
+| Набор | Файл | Источник |
 |---|---|---|
-| Безналичные потребительские расходы на уровне МО (по категориям трат) + справочник МО (id → название) | [sberindex.ru → дашборд «Потребительские безналичные расходы на уровне муниципальных образований»](https://sberindex.ru/ru/dashboards/potrebitelskie-beznalicnye-rashody-na-urovne-munizipalnyh-obrazovanij), кнопка скачивания CSV/Parquet | `data/raw/consumer_spending_mo.csv`, `data/raw/mo_dictionary.csv` |
-| Границы и изменения муниципальных образований | [sberindex.ru → исследование](https://sberindex.ru/ru/research/dataset-borders-and-changes-of-municipalities) | `data/raw/mo_borders/` |
-| Индекс покупательской мобильности (опционально) | [sberindex.ru → дашборд](https://sberindex.ru/ru/dashboards/indeks-mobilnosti) | `data/raw/mobility_mo.csv` |
-| Муниципальная статистика Росстата: население, зарплаты (опционально) | [База данных показателей муниципальных образований](https://rosstat.gov.ru/storage/mediabank/Munst.htm) | `data/raw/rosstat/` |
+| Потребительские безналичные расходы на уровне МО по категориям трат (СберИндекс) | `data/raw/consumption.parquet` | архив [hackathonlicence.zip](https://www.sberbank.com/common/img/uploaded/files/pdf/sberindex/hackathonlicence.zip) со страницы конкурса |
+| Индекс доступности рынков МО (СберИндекс) | `data/raw/market_access.parquet` | тот же архив |
+| Транспортные связи между МО (СберИндекс; в решении пока не используется) | `data/raw/connection.parquet` | тот же архив |
+| Справочник МО (id, название, регион, координаты центра) | `data/raw/dict/t_dict_municipal_districts.xlsx` | [t_dict_municipal.rar](https://www.sberbank.com/common/files/t_dict_municipal.rar) |
+| Реестр событий (паводок апреля 2024 г., со ссылками на источники) | `data/external/events.csv` | собран вручную, в репозитории |
 
-После скачивания проверьте названия колонок и при необходимости поправьте
-сопоставление в `configs/default.yaml` → `data.columns`
-(внутренние имена: `territory_id`, `date`, `category`, `value`).
+**consumption.parquet**: поля `territory_id` (МО в постоянных границах), `date` (YYYY-MM),
+`category`, `value` — оценка средних безналичных потребительских расходов жителя МО
+в месяц на основе моделей СберИндекса, руб. Январь 2023 — декабрь 2024, 6 категорий
+(«Продовольствие», «Здоровье», «Общественное питание», «Транспорт», «Маркетплейсы»,
+«Все категории»), 303 126 строк, 2 190 МО. Без пропусков за все 24 месяца —
+2 016 МО (12 096 рядов); в анализе используются они.
 
-Структура:
-
-```
-data/
-├── raw/         # исходные файлы, как скачаны
-├── interim/     # очищенные и объединённые таблицы
-└── processed/   # признаки для моделей
-```
-
-Использование данных — по условиям конкурса и лицензии СберИндекса.
+**Лицензия данных СберИндекса:** CC BY-SA 4.0. Цитирование: «Потребительские безналичные
+расходы на уровне муниципальных образований по категориям трат. СберИндекс. Данные доступны по адресу
+https://sberindex.ru/ru/research/data-sense-opisanie-nabora-dannikh-khakatona-sberindeksa-po-munitsipalnim-dannim
+(данные скачаны 08.10.2026)». Аналогично — индекс доступности рынков.

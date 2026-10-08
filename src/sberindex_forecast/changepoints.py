@@ -1,13 +1,20 @@
-"""Обнаружение точек структурных изменений (шоков) в рядах потребления.
+"""Обнаружение точек структурных изменений (сдвигов уровня) в рядах расходов МО.
 
-Два режима:
-* офлайн (ретроспективно, по всему ряду) — PELT и Binary Segmentation из
-  библиотеки ruptures; используются для разметки исторических шоков;
-* онлайн (по мере поступления данных) — двусторонний CUSUM по остаткам
-  прогноза; именно он отвечает за *раннее* выявление.
+Ряд для анализа — локальная компонента rel = log(y) - медиана log(y) по всем МО той
+же категории. Это убирает общую сезонность и общероссийские тренды: остаются
+изменения, характерные именно для данного муниципалитета.
 
-Качество сравнивается по точности/полноте с допуском ±tolerance месяцев
-и по средней задержке обнаружения (detection delay).
+Методы:
+* PELT и Binary Segmentation (библиотека ruptures, стоимость L2) — точный и
+  жадный поиск точек смены среднего со штрафом BIC-типа;
+* CUSUM — классический онлайн-метод: накопленная сумма отклонений от текущего
+  уровня, тревога при превышении порога.
+Все ряды стандартизуются оценкой шума sigma = MAD(разностей) / (0.6745 * sqrt(2)),
+поэтому пороги и штрафы сопоставимы между МО.
+
+Для раннего обнаружения все методы запускаются в «онлайн-режиме»: в каждый месяц t
+метод видит только данные до t включительно, фиксируется первый месяц, когда он
+сообщает о сдвиге рядом с истинной точкой (задержка обнаружения).
 """
 from __future__ import annotations
 
@@ -15,68 +22,76 @@ import numpy as np
 import ruptures as rpt
 
 
-def detect_pelt(signal: np.ndarray, model: str = "rbf", penalty: float = 10.0) -> list[int]:
-    """Индексы точек изменения (начало нового режима) методом PELT."""
-    signal = np.asarray(signal, dtype=float).reshape(-1, 1)
-    bkps = rpt.Pelt(model=model, min_size=2).fit(signal).predict(pen=penalty)
-    return [b for b in bkps if b < len(signal)]
+def noise_sigma(x: np.ndarray) -> float:
+    d = np.diff(np.asarray(x, float))
+    s = np.median(np.abs(d - np.median(d))) / 0.6745 / np.sqrt(2)
+    return float(s) if s > 1e-9 else float(np.std(d) + 1e-9)
 
 
-def detect_binseg(signal: np.ndarray, model: str = "l2", n_bkps: int = 3) -> list[int]:
-    """Индексы точек изменения методом Binary Segmentation (фиксированное число точек)."""
-    signal = np.asarray(signal, dtype=float).reshape(-1, 1)
-    n_bkps = max(0, min(n_bkps, len(signal) // 3))
-    if n_bkps == 0:
+def _standardize(x, sigma=None):
+    x = np.asarray(x, float)
+    return (x - x.mean()) / (sigma or noise_sigma(x))
+
+
+def detect_pelt(x, penalty: float = 3.0, min_size: int = 3, sigma=None, model: str = "l2") -> list[int]:
+    """Индексы начала новых режимов. penalty — множитель при log(n) (BIC-подобный штраф)."""
+    z = _standardize(x, sigma)
+    if len(z) < 2 * min_size:
         return []
-    bkps = rpt.Binseg(model=model, min_size=2).fit(signal).predict(n_bkps=n_bkps)
-    return [b for b in bkps if b < len(signal)]
+    bk = rpt.Pelt(model=model, min_size=min_size, jump=1).fit(z.reshape(-1, 1)).predict(pen=penalty * np.log(len(z)))
+    return [b for b in bk if b < len(z)]
 
 
-def cusum_alarms(residuals: np.ndarray, threshold: float = 5.0, drift: float = 0.5) -> list[int]:
-    """Онлайн двусторонний CUSUM по стандартизованным остаткам.
+def detect_binseg(x, penalty: float = 3.0, min_size: int = 3, sigma=None, model: str = "l2") -> list[int]:
+    z = _standardize(x, sigma)
+    if len(z) < 2 * min_size:
+        return []
+    bk = rpt.Binseg(model=model, min_size=min_size, jump=1).fit(z.reshape(-1, 1)).predict(pen=penalty * np.log(len(z)))
+    return [b for b in bk if b < len(z)]
 
-    Возвращает индексы, в которых сработала тревога; после тревоги
-    накопленные суммы обнуляются. Остатки стандартизуются по робастной
-    оценке масштаба (MAD), чтобы порог был сопоставим между МО.
-    """
-    r = np.asarray(residuals, dtype=float)
-    med = np.nanmedian(r)
-    mad = np.nanmedian(np.abs(r - med)) * 1.4826 or 1.0
-    z = (r - med) / mad
-    s_pos = s_neg = 0.0
-    alarms = []
-    for i, x in enumerate(z):
-        if np.isnan(x):
-            continue
-        s_pos = max(0.0, s_pos + x - drift)
-        s_neg = max(0.0, s_neg - x - drift)
-        if s_pos > threshold or s_neg > threshold:
-            alarms.append(i)
-            s_pos = s_neg = 0.0
+
+def cusum_alarms(x, threshold: float = 4.0, drift: float = 0.5, warmup: int = 6, sigma=None) -> list[int]:
+    """Онлайн двусторонний CUSUM. Опорный уровень — среднее с последнего сброса
+    (первые warmup точек — только накопление). Возвращает индексы тревог; оценка
+    начала сдвига — месяц, когда накопленная сумма последний раз была нулевой."""
+    x = np.asarray(x, float)
+    s = sigma or noise_sigma(x[: max(warmup, 3)] if len(x) >= 3 else x)
+    alarms, start = [], 0
+    while start + warmup < len(x):
+        ref = x[start: start + warmup].mean()
+        gp = gn = 0.0
+        last0p = last0n = start + warmup
+        fired = False
+        for t in range(start + warmup, len(x)):
+            z = (x[t] - ref) / s
+            gp, gn = max(0.0, gp + z - drift), max(0.0, gn - z - drift)
+            if gp == 0:
+                last0p = t + 1
+            if gn == 0:
+                last0n = t + 1
+            if gp > threshold or gn > threshold:
+                cp = last0p if gp > threshold else last0n
+                alarms.append(min(cp, t))
+                start, fired = min(cp, t), True
+                break
+        if not fired:
+            break
     return alarms
 
 
-def match_changepoints(true_cps: list[int], pred_cps: list[int], tolerance: int = 2) -> dict[str, float]:
-    """Precision / recall / F1 с допуском и средняя задержка обнаружения.
-
-    Предсказанная точка засчитывается, если она не раньше чем за tolerance
-    и не позже чем через tolerance месяцев от эталонной; каждая эталонная
-    точка сопоставляется не более одного раза.
-    """
-    used, delays, tp = set(), [], 0
-    for t in true_cps:
-        cands = [p for p in pred_cps if p not in used and -tolerance <= p - t <= tolerance]
-        if cands:
-            best = min(cands, key=lambda p: abs(p - t))
-            used.add(best)
-            delays.append(best - t)
-            tp += 1
-    precision = tp / len(pred_cps) if pred_cps else 0.0
-    recall = tp / len(true_cps) if true_cps else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "mean_delay": float(np.mean(delays)) if delays else float("nan"),
-    }
+def online_first_detection(x, method, true_cp: int | None, first_t: int, tol: int, max_delay: int, **kw):
+    """Прогоняем метод на x[:t+1] для t = first_t..; возвращает (месяц обнаружения или None,
+    была ли ложная тревога до/вне окна истинной точки)."""
+    false_alarm = False
+    for t in range(first_t, len(x)):
+        cps = method(x[: t + 1], **kw)
+        cps = [c for c in cps if c >= first_t - tol]  # интересуют только сдвиги в периоде мониторинга
+        if not cps:
+            continue
+        if true_cp is not None and any(abs(c - true_cp) <= tol for c in cps) and t - true_cp <= max_delay:
+            return t, false_alarm
+        if true_cp is None or all(abs(c - true_cp) > tol for c in cps):
+            false_alarm = True
+            if true_cp is None:
+                return None, True
+    return None, false_alarm

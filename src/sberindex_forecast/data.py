@@ -1,85 +1,84 @@
-"""Загрузка и приведение данных к единому «длинному» формату.
+"""Загрузка открытых данных конкурса и сборка панели «ряд × месяц».
 
-Внутренний формат — DataFrame с колонками:
-    territory_id : идентификатор муниципального образования (МО)
-    category     : категория трат (или "total")
-    date         : первый день месяца (datetime64)
-    value        : значение показателя
-
-Исходные файлы СберИндекса скачиваются вручную (см. data/README.md),
-сопоставление колонок задаётся в configs/default.yaml -> data.columns.
+Источник — архив hackathonlicence.zip со страницы конкурса (данные СберИндекса,
+лицензия CC BY-SA 4.0):
+* consumption.parquet — оценка средних безналичных потребительских расходов
+  жителей МО в месяц, руб. (поля territory_id, date, category, value),
+  январь 2023 — декабрь 2024, 6 категорий (включая «Все категории»);
+* market_access.parquet — индекс доступности рынков МО (2024);
+* справочник МО t_dict_municipal_districts.xlsx (id -> название, регион).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-# Страницы открытых данных, на которые ссылается сайт конкурса.
-DATA_SOURCES = {
-    "consumer_spending_mo": (
-        "https://sberindex.ru/ru/dashboards/"
-        "potrebitelskie-beznalicnye-rashody-na-urovne-munizipalnyh-obrazovanij"
+ROOT = Path(__file__).resolve().parents[2]
+
+DATA_URLS = {
+    "hackathon_archive": "https://www.sberbank.com/common/img/uploaded/files/pdf/sberindex/hackathonlicence.zip",
+    "mo_dictionary": "https://www.sberbank.com/common/files/t_dict_municipal.rar",
+    "dataset_description": (
+        "https://sberindex.ru/ru/research/"
+        "data-sense-opisanie-nabora-dannikh-khakatona-sberindeksa-po-munitsipalnim-dannim"
     ),
-    "mo_borders_and_changes": (
-        "https://sberindex.ru/ru/research/dataset-borders-and-changes-of-municipalities"
-    ),
-    "mobility_index": "https://sberindex.ru/ru/dashboards/indeks-mobilnosti",
-    "all_dashboards": "https://sberindex.ru/ru/dashboards/",
-    "rosstat_municipal_db": "https://rosstat.gov.ru/storage/mediabank/Munst.htm",
 }
 
-KEY_COLUMNS = ["territory_id", "category", "date"]
+
+@dataclass
+class Panel:
+    """Панель рядов: Y[i, t] — расходы ряда i в месяц months[t]."""
+
+    meta: pd.DataFrame          # territory_id, category, name, region_name, region_code, market_access
+    Y: np.ndarray               # (n_series, n_months), float
+    months: list[str]           # 'YYYY-MM'
+
+    def idx(self, month: str) -> int:
+        return self.months.index(month)
+
+    def subset(self, mask: np.ndarray) -> "Panel":
+        return Panel(self.meta[mask].reset_index(drop=True), self.Y[mask], self.months)
 
 
-def _read_any(path: Path) -> pd.DataFrame:
-    if path.suffix == ".parquet":
-        return pd.read_parquet(path)
-    # Файлы СберИндекса могут быть с разделителем ";" — определяем автоматически.
-    return pd.read_csv(path, sep=None, engine="python")
+def _path(p: str | Path) -> Path:
+    p = Path(p)
+    return p if p.is_absolute() else ROOT / p
 
 
-def load_spending(path: str | Path, columns: dict[str, str], freq: str = "MS") -> pd.DataFrame:
-    """Загрузить расходы по МО и привести к внутреннему формату.
-
-    Parameters
-    ----------
-    path : путь к .csv/.parquet
-    columns : отображение внутренних имён на имена колонок исходного файла
-        (ключи: territory_id, date, value и, опционально, category)
-    freq : частота рядов для выравнивания дат
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Нет файла {path}. Скачайте данные по инструкции в data/README.md "
-            f"(источник: {DATA_SOURCES['consumer_spending_mo']})."
-        )
-    raw = _read_any(path)
-    rename = {src: dst for dst, src in columns.items() if src in raw.columns}
-    missing = {"territory_id", "date", "value"} - set(rename.values())
-    if missing:
-        raise KeyError(
-            f"В файле нет колонок для {sorted(missing)}. "
-            f"Доступные колонки: {list(raw.columns)}. Поправьте data.columns в конфиге."
-        )
-    df = raw.rename(columns=rename)
-    if "category" not in df.columns:
-        df["category"] = "total"
-    df["date"] = pd.to_datetime(df["date"]).dt.to_period(freq[0]).dt.to_timestamp()
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = (
-        df[KEY_COLUMNS + ["value"]]
-        .dropna(subset=["value"])
-        .groupby(KEY_COLUMNS, as_index=False)["value"]
-        .sum()
-        .sort_values(KEY_COLUMNS)
-        .reset_index(drop=True)
-    )
-    return df
+def load_dictionary(path: str | Path) -> pd.DataFrame:
+    """Справочник МО: последняя версия записи на каждый territory_id."""
+    d = pd.read_excel(_path(path))
+    d = d.sort_values("year_to").drop_duplicates("territory_id", keep="last")
+    return d[["territory_id", "municipal_district_name", "region_name", "region_code",
+              "municipal_district_center_lat", "municipal_district_center_lon"]].rename(
+        columns={"municipal_district_name": "name",
+                 "municipal_district_center_lat": "lat",
+                 "municipal_district_center_lon": "lon"})
 
 
-def filter_short_series(df: pd.DataFrame, min_history: int) -> pd.DataFrame:
-    """Убрать ряды короче min_history наблюдений."""
-    sizes = df.groupby(["territory_id", "category"])["value"].transform("size")
-    return df[sizes >= min_history].reset_index(drop=True)
+def load_panel(cfg: dict) -> Panel:
+    """Собрать панель из consumption.parquet + справочник + индекс доступности рынков."""
+    dc = cfg["data"]
+    c = pd.read_parquet(_path(dc["consumption"]))
+    wide = c.pivot_table(index=["territory_id", "category"], columns="date",
+                         values="value", aggfunc="first")
+    months = sorted(wide.columns)
+    wide = wide[months]
+    if dc.get("require_complete", True):
+        wide = wide[wide.notna().all(axis=1) & (wide > 0).all(axis=1)]
+    meta = wide.index.to_frame(index=False)
+    meta = meta.merge(load_dictionary(dc["dictionary"]), on="territory_id", how="left")
+    ma = pd.read_parquet(_path(dc["market_access"]))
+    meta = meta.merge(ma, on="territory_id", how="left")
+    return Panel(meta.reset_index(drop=True), wide.to_numpy(dtype=float), list(months))
+
+
+def sample_territories(panel: Panel, n: int, seed: int) -> np.ndarray:
+    """Маска рядов случайной выборки из n МО (все категории каждого МО)."""
+    rng = np.random.default_rng(seed)
+    ids = np.sort(panel.meta["territory_id"].unique())
+    chosen = set(rng.choice(ids, size=min(n, len(ids)), replace=False).tolist())
+    return panel.meta["territory_id"].isin(chosen).to_numpy()

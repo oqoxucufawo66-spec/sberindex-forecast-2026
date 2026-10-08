@@ -1,62 +1,83 @@
-"""Дымовые тесты на *синтетических* рядах: проверяют, что код работает.
-
-Это не результаты на данных СберИндекса — только проверка корректности кода.
-"""
+"""Тесты корректности кода. Синтетические ряды — только для проверки логики,
+это не результаты на данных СберИндекса."""
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from sberindex_forecast.changepoints import cusum_alarms, detect_pelt, match_changepoints  # noqa: E402
-from sberindex_forecast.config import load_config  # noqa: E402
-from sberindex_forecast.evaluation import rolling_origins  # noqa: E402
-from sberindex_forecast.models.baselines import seasonal_naive_forecast  # noqa: E402
-from sberindex_forecast.pipeline import backtest  # noqa: E402
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from sberindex_forecast.changepoints import cusum_alarms, detect_binseg, detect_pelt  # noqa: E402
+from sberindex_forecast.config import load_config  # noqa: E402
+from sberindex_forecast.data import Panel  # noqa: E402
+from sberindex_forecast.evaluation import summarize  # noqa: E402
+from sberindex_forecast.models.baselines import naive, seasonal_naive, seasonal_naive_growth  # noqa: E402
+from sberindex_forecast.models.gbm import StrictDirectGBM, features_at  # noqa: E402
+from sberindex_forecast.news import event_matrix  # noqa: E402
+from sberindex_forecast.pipeline import add_combos, backtest  # noqa: E402
+
+MONTHS = [f"{y}-{m:02d}" for y in (2023, 2024) for m in range(1, 13)]
 
 
-def synthetic_panel(n_mo: int = 5, months: int = 48, seed: int = 0) -> pd.DataFrame:
+def synthetic_panel(n_mo=30, seed=0) -> Panel:
     rng = np.random.default_rng(seed)
-    dates = pd.date_range("2021-01-01", periods=months, freq="MS")
-    rows = []
+    cats = ["A", "B"]
+    rows, Y = [], []
+    t = np.arange(24)
     for mo in range(n_mo):
-        level = rng.uniform(50, 150)
-        season = 10 * np.sin(2 * np.pi * dates.month / 12)
-        trend = np.linspace(0, 20, months)
-        shock = np.where(np.arange(months) >= 30, -25, 0)  # искусственный шок
-        y = level + season + trend + shock + rng.normal(0, 2, months)
-        rows += [(mo, "total", d, v) for d, v in zip(dates, y)]
-    return pd.DataFrame(rows, columns=["territory_id", "category", "date", "value"])
+        for c in cats:
+            level = rng.uniform(5_000, 30_000)
+            y = level * (1 + 0.01 * t) * (1 + 0.1 * np.sin(2 * np.pi * t / 12)) * rng.normal(1, 0.01, 24)
+            Y.append(y)
+            rows.append({"territory_id": mo, "category": c, "name": f"МО {mo}", "region_name": "Р",
+                         "region_code": mo % 3, "market_access": rng.uniform(100, 500)})
+    return Panel(pd.DataFrame(rows), np.array(Y), MONTHS)
 
 
-def test_seasonal_naive():
-    s = pd.Series(np.arange(24.0), index=pd.date_range("2020-01-01", periods=24, freq="MS"))
-    assert seasonal_naive_forecast(s, 3).tolist() == [12.0, 13.0, 14.0]
+def test_baselines_use_only_past():
+    Y = np.arange(24, dtype=float)[None, :] + 1
+    assert naive(Y, 10, 3)[0] == 11
+    assert seasonal_naive(Y, 20, 3)[0] == Y[0, 11]      # T-12 = 11 <= o
+    assert seasonal_naive(Y, 5, 3)[0] == Y[0, 5]        # нет года истории -> наивный
+    assert np.isclose(seasonal_naive_growth(Y, 20, 1)[0], Y[0, 9] * Y[0, 20] / Y[0, 8])
 
 
-def test_rolling_origins_leave_room_for_horizon():
-    dates = pd.Series(pd.date_range("2020-01-01", periods=36, freq="MS"))
-    cuts = rolling_origins(dates, n_folds=3, step=1, horizon=12)
-    assert cuts[-1] + pd.DateOffset(months=12) <= dates.max()
+def test_gbm_is_strict():
+    p = synthetic_panel()
+    gbm = StrictDirectGBM({"n_estimators": 20, "verbose": -1})
+    pred, _ = gbm.fit_predict(p.Y, p.meta, p.months, 20, 3)
+    assert pred.shape == (len(p.Y),) and np.isfinite(pred).all()
+    assert gbm.fit_predict(p.Y, p.meta, p.months, 11, 12) == (None, None)  # нет обучающих пар
+    f = features_at(p.Y, p.meta, p.months, 5, 1)
+    Y2 = p.Y.copy(); Y2[:, 6:] = 0                       # будущее не должно влиять на признаки
+    pd.testing.assert_frame_equal(f, features_at(Y2, p.meta, p.months, 5, 1))
 
 
-def test_changepoints_find_synthetic_shock():
-    y = synthetic_panel(1)["value"].to_numpy()
-    cps = detect_pelt(y, model="l2", penalty=500)
-    assert match_changepoints([30], cps, tolerance=2)["recall"] == 1.0
-    alarms = cusum_alarms(np.r_[np.zeros(30), np.full(10, 5.0)] + np.random.default_rng(1).normal(0, 1, 40))
-    assert any(30 <= a <= 33 for a in alarms)
+def test_backtest_and_combos():
+    p = synthetic_panel()
+    cfg = load_config(ROOT / "configs/default.yaml")
+    cfg["models"]["lightgbm"]["n_estimators"] = 20
+    preds, _ = backtest(p, cfg, ["naive", "seasonal_naive", "snaive_growth", "lightgbm"])
+    m = summarize(preds)
+    assert set(m.horizon) == {1, 3, 6, 12}
+    assert "lightgbm" not in set(m[m.horizon == 12].model)
+    assert "combo_gbm_fm" in set(m.model)
+    assert (m.MAE >= 0).all()
 
 
-def test_backtest_runs():
-    cfg = load_config(ROOT / "configs" / "default.yaml")
-    cfg["validation"]["n_folds"] = 2
-    cfg["forecast"]["horizons"] = [1, 3]
-    cfg["models"]["lightgbm"]["n_estimators"] = 50
-    preds, metrics = backtest(synthetic_panel(), cfg)
-    assert set(metrics["model"]) == {"naive", "seasonal_naive", "lightgbm"}
-    assert metrics["MAE"].notna().all()
+def test_changepoints_detect_step():
+    rng = np.random.default_rng(1)
+    x = np.r_[np.zeros(12), np.full(12, 1.0)] + rng.normal(0, 0.1, 24)
+    for fn in (detect_pelt, detect_binseg):
+        assert any(abs(c - 12) <= 1 for c in fn(x, penalty=3.0))
+    assert any(11 <= a <= 13 for a in cusum_alarms(x, threshold=4.0))
+    assert detect_pelt(rng.normal(0, 0.1, 24), penalty=8.0) == []
+
+
+def test_event_matrix_no_future():
+    meta = pd.DataFrame({"territory_id": [1, 2]})
+    ev = pd.DataFrame({"event_id": ["e"], "territory_id": [1], "month": ["2024-04"]})
+    E = event_matrix(ev, meta, MONTHS)
+    assert E[0, MONTHS.index("2024-03")] == 0 and E[0, MONTHS.index("2024-04")] == 1 and E[1].sum() == 0

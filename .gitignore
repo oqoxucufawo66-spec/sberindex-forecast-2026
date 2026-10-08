@@ -26,3 +26,8 @@ models_cache/
 .vscode/
 .DS_Store
 .env
+
+# Промежуточные HTML сборки PDF и крупные сырые таблицы
+reports/*.html
+reports/results/cpd_real_all.csv
+reports/results/cpd_benchmark_raw.csv
