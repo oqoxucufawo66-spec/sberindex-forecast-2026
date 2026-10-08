@@ -1,0 +1,77 @@
+# Конфигурация эксперимента. Все гиперпараметры — здесь, а не в коде.
+
+data:
+  # Файл с безналичными потребительскими расходами на уровне МО (скачивается вручную,
+  # см. data/README.md). Поддерживаются .csv и .parquet.
+  spending_path: data/raw/consumer_spending_mo.csv
+  # Справочник муниципальных образований (id -> название, регион)
+  mo_dictionary_path: data/raw/mo_dictionary.csv
+  # Сопоставление колонок исходного файла с внутренними именами.
+  # Уточняется после загрузки фактического датасета.
+  columns:
+    territory_id: territory_id
+    date: date
+    category: category
+    value: value
+  # Частота рядов (MS — начало месяца)
+  freq: MS
+  # Минимальная длина ряда (в месяцах), чтобы участвовать в обучении
+  min_history: 24
+
+forecast:
+  horizons: [1, 3, 6, 12]       # горизонты прогнозирования, мес.
+  season_length: 12
+  target_transform: log1p       # log1p | none
+
+validation:
+  # Скользящее окно с расширением (rolling origin): последние n_folds срезов
+  n_folds: 6
+  step: 1                       # сдвиг между срезами, мес.
+
+features:
+  lags: [1, 2, 3, 6, 12]
+  rolling_windows: [3, 6, 12]
+  calendar: true
+  yoy_growth: true
+
+models:
+  naive: {}
+  seasonal_naive: {}
+  prophet:
+    yearly_seasonality: true
+    weekly_seasonality: false
+    daily_seasonality: false
+    changepoint_prior_scale: 0.05
+  lightgbm:
+    n_estimators: 600
+    learning_rate: 0.03
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    random_state: 42
+    verbose: -1
+  chronos:
+    enabled: false              # требует requirements-fm.txt
+    model_id: amazon/chronos-bolt-small
+    device: cpu
+
+changepoints:
+  # Офлайн-методы (ruptures)
+  pelt:
+    model: rbf
+    penalty: 10
+  binseg:
+    model: l2
+    n_bkps: 3
+  # Онлайн-метод для раннего обнаружения
+  cusum:
+    threshold: 5.0
+    drift: 0.5
+  # Допуск при сопоставлении найденной точки с эталонной, мес.
+  tolerance: 2
+
+output:
+  dir: reports/runs

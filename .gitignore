@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Данные: сырые и промежуточные файлы не храним в репозитории
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Артефакты запусков
+reports/runs/
+models_cache/
+*.parquet
+*.pkl
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+.env
